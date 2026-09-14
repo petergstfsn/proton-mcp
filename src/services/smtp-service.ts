@@ -3,6 +3,7 @@ import nodemailer, { type SentMessageInfo, type Transporter } from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import sanitizeHtml from "sanitize-html";
 import type { ProtonMailConfig, SendEmailInput } from "../types/index.js";
+import { ensureOutboundRecipientsAllowed, ensureSendAllowed } from "../utils/runtime-policy.js";
 import { htmlToMarkdown } from "../utils/helpers.js";
 import { logger } from "../utils/logger.js";
 
@@ -44,6 +45,8 @@ export function applySignature(
   };
 }
 
+export class SendNotAttemptedError extends Error {}
+
 export class SMTPService {
   private transporter?: Transporter;
 
@@ -55,8 +58,16 @@ export class SMTPService {
   }
 
   async sendEmail(input: SendEmailInput): Promise<SentMessageInfo> {
+    let options: ReturnType<SMTPService["buildMailOptions"]>;
+    try {
+      ensureSendAllowed(this.config.runtime);
+      ensureOutboundRecipientsAllowed(this.config.runtime, this.config.smtp.username, [...input.to, ...(input.cc ?? []), ...(input.bcc ?? [])]);
+      options = this.buildMailOptions(input);
+    } catch (error) {
+      throw new SendNotAttemptedError(error instanceof Error ? error.message : String(error), { cause: error });
+    }
     const transporter = this.getTransporter();
-    return transporter.sendMail(this.buildMailOptions(input));
+    return transporter.sendMail(options);
   }
 
   async buildRawMessage(input: SendEmailInput): Promise<Buffer> {

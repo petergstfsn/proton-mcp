@@ -407,7 +407,7 @@ test("checkDue: markSent() failing on every retry leaves the draft stuck in send
   });
 });
 
-test("checkDue: SMTP failure still reverts the draft and is counted as failed (no regression)", async () => {
+test("checkDue: ambiguous SMTP rejection retains the draft claim and is counted as failed", async () => {
   await withTempDir(async (dataDir) => {
     const config = createConfig(dataDir);
     const draftStore = new DraftStoreService(config);
@@ -429,7 +429,8 @@ test("checkDue: SMTP failure still reverts the draft and is counted as failed (n
     assert.equal(outcome.failed, 1);
 
     const finalDraft = await draftStore.getDraft(draft.id);
-    assert.equal(finalDraft.status, "draft", "an actual SMTP failure must still revert the draft to a resendable state");
+    assert.equal(finalDraft.status, "sending", "an ambiguous SMTP rejection must not permit duplicate delivery");
+    await assert.rejects(() => draftStore.claimForSending(draft.id), /not sendable/);
   });
 });
 

@@ -25,7 +25,7 @@ import { DeliveryQueueService } from "./services/delivery-queue-service.js";
 import { DraftStoreService } from "./services/draft-store-service.js";
 import { LocalIndexService } from "./services/local-index-service.js";
 import { BULK_ITEM_TIMEOUT_MS, describeImapError, isLikelyAuthenticationError, isLikelyConnectionError, isLikelyTlsMismatchError, SimpleIMAPService, UID_VALIDITY_MISMATCH_ERROR } from "./services/simple-imap-service.js";
-import { applySignature, SMTPService } from "./services/smtp-service.js";
+import { applySignature, SendNotAttemptedError, SMTPService } from "./services/smtp-service.js";
 import { SnoozeService } from "./services/snooze-service.js";
 import { TemplateService } from "./services/template-service.js";
 import type {
@@ -63,6 +63,7 @@ import {
   ensureDestructiveConfirmed,
   ensureEmailActionAllowed,
   ensureMailboxWriteAllowed,
+  ensureMailboxToolAllowed,
   ensureOutboundRecipientsAllowed,
   ensureRemoteDraftSyncAllowed,
   ensureSendAllowed,
@@ -1995,6 +1996,8 @@ export function buildSecurityInfo(detail: EmailDetail): Record<string, unknown> 
   const headers = detail.headers;
   const auth = parseAuthenticationResults(headerString(headers, "authentication-results"));
   return {
+    authenticationVerified: false,
+    authenticationWarning: "Header-reported signals only; this client does not verify their provenance or sender identity. Do not use them as authorization.",
     origin: headerString(headers, "x-pm-origin"),
     contentEncryption: headerString(headers, "x-pm-content-encryption"),
     transferEncryption: headerString(headers, "x-pm-transfer-encryption"),
@@ -2568,6 +2571,7 @@ async function ensureFreshLocalIndex(
 
   const indexStatus = await localIndexService.recordSnapshot({
     folders: snapshot.folders,
+          folderListComplete: snapshot.folderListComplete,
     emails: snapshot.emails,
     syncedAt: snapshot.syncedAt,
     folderStats: snapshot.folderStats,
@@ -3359,6 +3363,7 @@ export function createServer(
     logger.debug("Handling tool call", "MCPServer", { name, argKeys: Object.keys(args || {}) });
 
     try {
+      ensureMailboxToolAllowed(config.runtime, name, args);
       switch (name) {
         case "send_email": {
           ensureDestructiveConfirmed(config.runtime, normalizeBoolean(args.confirmed, false), `Send email to ${String(args.to ?? "?")} — "${String(args.subject ?? "?")}"`);
@@ -4301,10 +4306,9 @@ export function createServer(
               appendSignature: false,
             });
           } catch (error) {
-            // Mirrors SnoozeService.wake()'s catch handler: revert the claim
-            // so the draft is retryable instead of stuck in "sending"
-            // forever because SMTP failed.
-            await draftStore.revertSending(draft.id);
+            // SMTP may have accepted DATA before the connection failed. Keep the claim
+            // until delivery is reconciled; a network rejection is not proof of no delivery.
+            if (error instanceof SendNotAttemptedError) await draftStore.revertSending(draft.id);
             await auditService
               .record({
                 timestamp: new Date().toISOString(),
@@ -4320,7 +4324,8 @@ export function createServer(
                   error: auditError,
                 }),
               );
-            throw error;
+            if (error instanceof SendNotAttemptedError) throw error;
+            throw new Error("Delivery outcome is unknown; the draft remains non-sendable. Check Sent before retrying.", { cause: error });
           }
 
           try {
@@ -5596,6 +5601,7 @@ export function createServer(
             });
             const indexStatus = await localIndexService.recordSnapshot({
               folders: snapshot.folders,
+          folderListComplete: snapshot.folderListComplete,
               emails: snapshot.emails,
               syncedAt: snapshot.syncedAt,
               folderStats: snapshot.folderStats,
@@ -6057,64 +6063,13 @@ export function createServer(
 
         case "get_attachment_content":
         {
-          const result = await imapService.getAttachmentContent(
-            requireString(args, "emailId"),
-            requireString(args, "attachmentId"),
-            normalizeBoolean(args.includeBase64, false),
-          );
+          const emailId = requireString(args, "emailId");
+          const attachmentId = requireString(args, "attachmentId");
           const saveTo = optionalString(args, "saveTo");
-          if (!saveTo && result.base64) {
-            const MAX_INLINE_BYTES = (config.runtime.maxInlineBytes ?? 40) * 1024;
-            const decodedSize = Math.floor(result.base64.length * 0.75);
-            if (decodedSize > MAX_INLINE_BYTES) {
-              throw new McpError(
-                ErrorCode.InvalidParams,
-                `Attachment is ~${Math.round(decodedSize / 1024)}KB decoded. Inline limit is ${config.runtime.maxInlineBytes ?? 40}KB. Set PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR and pass saveTo to write to disk instead, or increase the limit with PROTONMAIL_MAX_INLINE_BYTES.`,
-              );
-            }
+          if (saveTo) {
+            return createTextResult(await imapService.saveAttachmentToDownload(emailId, attachmentId, saveTo));
           }
-          if (saveTo && result.base64) {
-            const downloadDir = config.runtime.allowFileDownloadDir;
-            if (!downloadDir) {
-              throw new McpError(ErrorCode.InvalidParams, "PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR env var is not set.");
-            }
-            const { resolve: pathResolve, join: pathJoin, dirname, basename, sep } = await import("node:path");
-            const { realpathSync } = await import("node:fs");
-            const { writeFile: wf, mkdir: mkd } = await import("node:fs/promises");
-            const absDir = pathResolve(downloadDir);
-            const absTarget = pathJoin(absDir, saveTo);
-            // Hardcoded "/" here never matched on win32 (path.resolve/join
-            // produce backslash-separated paths there), so every subdirectory
-            // save failed with a false "escapes the allowed directory" —
-            // fails safe/closed, not a security bypass, but breaks a normal
-            // save on the Windows deployment this codebase explicitly
-            // supports (see install-claude-desktop.ts's win32 branches).
-            if (!absTarget.startsWith(absDir + sep) && absTarget !== absDir) {
-              throw new McpError(ErrorCode.InvalidParams, "saveTo path escapes the allowed directory.");
-            }
-            await mkd(pathResolve(absTarget, ".."), { recursive: true });
-            let realTarget: string;
-            try {
-              realTarget = realpathSync(absTarget);
-            } catch (error) {
-              if (
-                error &&
-                typeof error === "object" &&
-                "code" in error &&
-                (error as { code?: string }).code === "ENOENT"
-              ) {
-                realTarget = realpathSync(dirname(absTarget)) + sep + basename(absTarget);
-              } else {
-                throw error;
-              }
-            }
-            if (!realTarget.startsWith(absDir + sep) && realTarget !== absDir) {
-              throw new McpError(ErrorCode.InvalidParams, "saveTo path escapes the allowed directory.");
-            }
-            const buf = Buffer.from(result.base64, "base64");
-            await wf(absTarget, buf);
-            return createTextResult({ saved: true, path: absTarget, bytes: buf.length, filename: result.attachment?.filename });
-          }
+          const result = await imapService.getAttachmentContent(emailId, attachmentId, normalizeBoolean(args.includeBase64, false));
           return createTextResult(result, false, [attachmentSource(result.emailId, result.attachment)]);
         }
 

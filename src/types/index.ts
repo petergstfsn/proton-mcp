@@ -145,6 +145,8 @@ export interface EmailAttachmentSummary {
 }
 
 export interface EmailSummary {
+  /** False for source-free metadata refreshes; preserve previously parsed immutable fields. */
+  detailsComplete?: boolean;
   id: string;
   folder: string;
   uid: number;
@@ -434,6 +436,8 @@ export interface SyncEmailsInput {
 }
 
 export interface MailboxSyncCheckpoint {
+  /** Next historical reconciliation window ends below this UID; independent of initial backfill. */
+  reconcileToUid?: number;
   folder: string;
   uidValidity?: string;
   uidNext?: number;

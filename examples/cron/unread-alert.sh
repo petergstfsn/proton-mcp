@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Checks unread count in INBOX and prints an alert if it crosses a threshold.
-# Exit code is 0 always (so cron doesn't email you a failure) — wire stdout
+# Errors produce a nonzero exit so broken credentials or JSON are visible. Wire stdout
 # into your own notification method (a webhook, a Slack CLI, etc).
 #
 # Install (crontab -e), checks every 30 minutes during work hours:
@@ -9,8 +9,8 @@ set -euo pipefail
 
 THRESHOLD="${PROTONMAIL_UNREAD_THRESHOLD:-20}"
 
-UNREAD=$(proton-mail-bridge-client emails --folder INBOX --json \
-  | jq '[.[] | select(.isRead == false)] | length')
+UNREAD=$(proton-mail-bridge-client tool count_messages --args '{"folder":"INBOX","isRead":false}' --json \
+  | jq -er '.structuredContent.count | select(type == "number" and . >= 0)')
 
 if [ "$UNREAD" -ge "$THRESHOLD" ]; then
   echo "Unread count in INBOX ($UNREAD) has reached the alert threshold ($THRESHOLD)."

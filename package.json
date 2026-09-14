@@ -33,10 +33,11 @@
     "prepare": "npm run build",
     "lint": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "ci": "npm run lint && npm test",
+    "ci": "npm run check:release-metadata && npm run lint && npm test",
     "pack:check": "npm pack --dry-run",
-    "release:check": "npm run lint && npm test && npm run pack:check",
-    "package:mcpb": "node scripts/build-mcpb.mjs"
+    "release:check": "npm run check:release-metadata && npm run lint && npm test && npm run pack:check",
+    "package:mcpb": "node scripts/build-mcpb.mjs",
+    "check:release-metadata": "node scripts/check-release-metadata.mjs"
   },
   "keywords": [
     "protonmail",

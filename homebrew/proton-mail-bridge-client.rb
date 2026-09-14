@@ -6,8 +6,8 @@ require "language/node"
 class ProtonMailBridgeClient < Formula
   desc "Full-featured CLI and Claude Desktop MCP for Proton Mail via Proton Bridge"
   homepage "https://github.com/googlarz/proton-mail-bridge-client"
-  url "https://registry.npmjs.org/proton-mail-bridge-client/-/proton-mail-bridge-client-1.11.1.tgz"
-  sha256 "566281095a4789f838ea620909de3461827579ab"
+  url "https://registry.npmjs.org/proton-mail-bridge-client/-/proton-mail-bridge-client-2.0.8.tgz"
+  sha256 "c1a39fa176a755f054ce56161b5a59c927285c75f9e41cacd5d3d98b530b06c8"
   license "MIT"
 
   depends_on "node"
@@ -32,6 +32,6 @@ class ProtonMailBridgeClient < Formula
 
   test do
     output = shell_output("#{bin}/proton-mail-bridge-client --version 2>&1")
-    assert_match "1.11.1", output
+    assert_match "2.0.8", output
   end
 end

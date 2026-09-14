@@ -10,10 +10,10 @@ import { buildConfigFromEnv, createServer, withAudit } from "./index.js";
 import { isMainModule } from "./is-main.js";
 import { SimpleIMAPService } from "./services/simple-imap-service.js";
 import type { EmailAddress, EmailDetail, EmailSummary, ProtonMailConfig, SearchEmailsInput } from "./types/index.js";
-import { ensureDestructiveConfirmed, ensureEmailActionAllowed, ensureMailboxWriteAllowed, ensureSendAllowed, sanitizeRuntimeConfig } from "./utils/runtime-policy.js";
+import { ensureDestructiveConfirmed, ensureEmailActionAllowed, ensureMailboxWriteAllowed, ensureSendAllowed, ensureOutboundRecipientsAllowed, sanitizeRuntimeConfig } from "./utils/runtime-policy.js";
 import { isValidEmail, lowerCaseAddress, parseEmails, ensureValidEmails } from "./utils/helpers.js";
 import { getClaudeDesktopInstallStatus } from "./scripts/check-claude-desktop.js";
-import { installClaudeDesktopConfig } from "./scripts/install-claude-desktop.js";
+import { installClaudeDesktopConfig, installStatusForOutput } from "./scripts/install-claude-desktop.js";
 import { runClaudeDesktopSetupWizard } from "./scripts/setup-claude-desktop.js";
 
 let _pkgVersion: string | undefined;
@@ -909,7 +909,7 @@ async function runMove(parsed: ParsedCliArgs): Promise<void> {
   if (!targetFolder) throw new Error("move requires a target folder as a second argument or --folder");
   const wantJson = isTruthyFlag(parsed.flags.json);
   await withServices(async ({ config, imapService, auditService }) => {
-    ensureMailboxWriteAllowed(config.runtime);
+    ensureEmailActionAllowed(config.runtime, "move");
     // Found live: every write command in this file called the service
     // directly, so none of them ever produced an audit.log entry — unlike
     // the identical action through an MCP tool call, which withAudit always
@@ -997,7 +997,7 @@ async function runDelete(parsed: ParsedCliArgs): Promise<void> {
   if (!emailId) throw new Error("delete requires an emailId");
   const wantJson = isTruthyFlag(parsed.flags.json);
   await withServices(async ({ config, imapService, auditService }) => {
-    ensureMailboxWriteAllowed(config.runtime);
+    ensureEmailActionAllowed(config.runtime, "delete");
     // Found live: this called the service directly, bypassing the MCP
     // tool layer's ensureDestructiveConfirmed entirely — with
     // PROTONMAIL_CONFIRM_DESTRUCTIVE=true, `tool delete_email` correctly
@@ -1120,6 +1120,12 @@ async function runReply(parsed: ParsedCliArgs): Promise<void> {
     const detail = await imapService.getEmailById(emailId);
     const recipients = getReplyRecipients(detail, config.smtp.username, replyAll);
     if (recipients.to.length === 0) throw new Error("Unable to infer reply recipient.");
+    ensureOutboundRecipientsAllowed(config.runtime, config.smtp.username, [...recipients.to, ...recipients.cc]);
+    if (isTruthyFlag(parsed.flags["dry-run"])) {
+      process.stdout.write(json({ dryRun: true, wouldSendTo: recipients, subject: prefixedSubject(detail.subject, "Re:"), body: buildReplyText(detail, body!) }));
+      return;
+    }
+    ensureDestructiveConfirmed(config.runtime, isTruthyFlag(parsed.flags.confirmed), `Reply to ${emailId}`);
     const result = await withAudit(auditService, "reply_to_email", { emailId, replyAll }, () =>
       smtpService.sendEmail({
         to: recipients.to,
@@ -1152,7 +1158,13 @@ async function runForward(parsed: ParsedCliArgs): Promise<void> {
   await withServices(async ({ config, smtpService, imapService, auditService }) => {
     ensureSendAllowed(config.runtime);
     ensureValidEmails(to, "to");
+    ensureOutboundRecipientsAllowed(config.runtime, config.smtp.username, to);
     const detail = await imapService.getEmailById(emailId);
+    if (isTruthyFlag(parsed.flags["dry-run"])) {
+      process.stdout.write(json({ dryRun: true, wouldSendTo: { to }, subject: prefixedSubject(detail.subject, "Fwd:"), body: buildForwardText(detail, body) }));
+      return;
+    }
+    ensureDestructiveConfirmed(config.runtime, isTruthyFlag(parsed.flags.confirmed), `Forward ${emailId}`);
     const result = await withAudit(auditService, "forward_email", { emailId, to }, () =>
       smtpService.sendEmail({
         to,
@@ -1935,7 +1947,7 @@ async function runClaude(parsed: ParsedCliArgs): Promise<void> {
     case "install":
     case "update": {
       const result = await installClaudeDesktopConfig();
-      process.stdout.write(json(result));
+      process.stdout.write(json(installStatusForOutput(result)));
       return;
     }
     case "check":

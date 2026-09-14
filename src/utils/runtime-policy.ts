@@ -110,3 +110,30 @@ export function ensureDestructiveConfirmed(
     `Confirmation required: ${description}\n\nThis action is irreversible. Call this tool again with confirmed: true after asking the user to confirm.`,
   );
 }
+
+// All alternate mailbox entrypoints pass here before resolving IDs or doing I/O.
+export function ensureMailboxToolAllowed(runtime: ProtonRuntimeConfig, name: string, args: Record<string, unknown>): void {
+  const actions: Record<string, EmailAction> = {
+    delete_email: "delete", empty_folder: "delete", move_thread: "move",
+  };
+  const action = Object.hasOwn(actions, name) ? actions[name] : undefined;
+  if (action) ensureEmailActionAllowed(runtime, action);
+  if (name === "bulk_delete" || name === "delete_thread") {
+    ensureEmailActionAllowed(runtime, args.permanent === true ? "delete" : "trash");
+  }
+  if (["update_message_flags", "bulk_update_flags", "flag_thread"].includes(name)) {
+    ensureMailboxWriteAllowed(runtime);
+    const flags = (value: unknown): string[] => Array.isArray(value) ? value.map(String) : [];
+    for (const [values, removing] of [[flags(args.flagsToAdd), false], [flags(args.flagsToRemove), true]] as const) {
+      for (const flag of values) {
+        const mapped: Record<string, EmailAction> = removing
+          ? { "\\seen": "mark_unread", "\\flagged": "unstar", "\\deleted": "restore" }
+          : { "\\seen": "mark_read", "\\flagged": "star", "\\deleted": "delete" };
+        const key = flag.toLowerCase();
+        const required = Object.hasOwn(mapped, key) ? mapped[key] : undefined;
+        if (required) ensureEmailActionAllowed(runtime, required);
+        if (required === "delete") ensureDestructiveConfirmed(runtime, args.confirmed === true, "Mark messages for deletion");
+      }
+    }
+  }
+}

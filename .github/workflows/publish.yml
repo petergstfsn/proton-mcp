@@ -7,6 +7,8 @@ on:
 
 jobs:
   publish:
+    # The fork does not own the upstream npm package or trusted publisher.
+    if: github.repository == 'googlarz/proton-mail-bridge-client'
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -22,7 +22,7 @@ Claude
 
 Every step in that chain is local. Proton Bridge runs on your machine and exposes your mail over localhost IMAP/SMTP — the same way Thunderbird or Apple Mail connects. The client reads that local IMAP, builds a local SQLite index for fast search, and exposes an MCP server over stdio so Claude Desktop can call it as a local process.
 
-No relay. No remote URL. No OAuth. No third party ever touches your mail.
+No relay. No remote URL. No OAuth. The Bridge connection is local. A cloud AI client may transmit email content to its model provider; use a local model when content must stay on the machine.
 
 ## What you can do with it
 
