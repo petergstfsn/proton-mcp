@@ -43,4 +43,5 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t proton-mail-bridge-client:ci .
       - name: Verify runtime imports and native SQLite
-        run: docker run --rm --entrypoint node proton-mail-bridge-client:ci --input-type=module -e "await import('./dist/index.js'); const {default: Database} = await import('better-sqlite3'); new Database(':memory:').close()"
+        run: |
+          docker run --rm --entrypoint node proton-mail-bridge-client:ci --input-type=module -e "await import('./dist/index.js'); const {default: Database} = await import('better-sqlite3'); new Database(':memory:').close()"
