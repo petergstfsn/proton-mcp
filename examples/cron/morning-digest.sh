@@ -7,6 +7,7 @@
 # Install (crontab -e), runs weekdays at 8am:
 #   0 8 * * 1-5 /path/to/morning-digest.sh
 set -euo pipefail
+umask 077
 
 LOG_DIR="${PROTONMAIL_DIGEST_LOG_DIR:-$HOME/.proton-mail-bridge-client/digests}"
 mkdir -p "$LOG_DIR"

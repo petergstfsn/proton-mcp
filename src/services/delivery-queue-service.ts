@@ -8,7 +8,7 @@ import { isProcessAlive, withFileLock } from "../utils/file-lock.js";
 import { ensureOutboundRecipientsAllowed, ensureSendAllowed } from "../utils/runtime-policy.js";
 import { logger, type Logger } from "../utils/logger.js";
 import { withTimeout } from "../utils/helpers.js";
-import { SMTPService } from "./smtp-service.js";
+import { SMTPService, SendNotAttemptedError } from "./smtp-service.js";
 import type { DraftStoreService } from "./draft-store-service.js";
 
 const SEND_ITEM_TIMEOUT_MS = 30_000;
@@ -266,6 +266,8 @@ export class DeliveryQueueService {
         }
       }
 
+      let sendAttempted = false;
+      let delivered: Awaited<ReturnType<SMTPService["sendEmail"]>> | undefined;
       try {
         // Runtime policy (allowSend/readOnly/restrictOutboundToSelf) is only
         // checked at enqueue time by the tool handler — re-check it here too,
@@ -283,11 +285,14 @@ export class DeliveryQueueService {
         // item indefinitely: checkDue() only reschedules its next tick
         // (scheduleNext()) after the whole pass settles, and this loop
         // wouldn't even reach later dueIds until the current send resolved.
+        sendAttempted = true;
         const result = await withTimeout(
           this.smtpService.sendEmail(claimed.payload),
           SEND_ITEM_TIMEOUT_MS,
           `Timed out after ${SEND_ITEM_TIMEOUT_MS}ms sending queued item ${id}`,
         );
+        delivered = result;
+        sent += 1;
         await this.withLock(async () => {
           const store = await this.loadUnlocked();
           const record = store.items[id];
@@ -298,7 +303,6 @@ export class DeliveryQueueService {
             await this.save(store);
           }
         });
-        sent += 1;
 
         // The draft was already claimed above, before SMTP — mark it sent
         // now that delivery has actually completed, so both this path and
@@ -345,10 +349,23 @@ export class DeliveryQueueService {
           }
         }
       } catch (error) {
-        // SMTP failed (or timed out) after the draft claim succeeded above —
-        // revert it so the draft isn't stuck in "sending" forever, exactly
-        // like send_draft's own catch handler does for the same failure.
-        if (claimedDraft) {
+        if (delivered) {
+          // Delivery is certain. Persisting its receipt must not convert it
+          // into a retryable failure or prevent later queued items running.
+          if (claimedDraft) await this.draftStore!.markSent(claimedDraft.id, delivered).catch(() => {});
+          await this.withLock(async () => {
+            const store = await this.loadUnlocked();
+            const record = store.items[id];
+            if (record?.status === "sending") {
+              record.status = "sent";
+              record.sentAt = new Date().toISOString();
+              record.sentMessageId = delivered!.messageId;
+              await this.save(store);
+            }
+          }).catch(persistenceError => this.log.error("Mail delivered; persisting delivery receipt failed. Reconcile before retrying.", "DeliveryQueueService", { id, error: persistenceError }));
+          continue;
+        }
+        if (claimedDraft && (!sendAttempted || error instanceof SendNotAttemptedError)) {
           await this.draftStore!.revertSending(claimedDraft.id);
         }
         const rawMessage = error instanceof Error ? error.message : String(error);
@@ -360,7 +377,7 @@ export class DeliveryQueueService {
         // true outcome is exactly as unknown as recoverInterruptedSends'
         // restart-recovery case (see its comment) — say so explicitly
         // instead of implying delivery didn't happen.
-        const message = rawMessage.startsWith("Timed out after")
+        const message = sendAttempted && !(error instanceof SendNotAttemptedError)
           ? `${rawMessage} — delivery outcome is unknown, the send may still complete in the background. Check the mailbox's Sent folder to confirm before resending.`
           : rawMessage;
         this.log.warn("Delivery queue item failed to send", "DeliveryQueueService", { id, error });

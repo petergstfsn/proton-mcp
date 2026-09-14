@@ -109,6 +109,7 @@ export class BackgroundSyncService {
 
         await this.localIndexService.recordSnapshot({
           folders: snapshot.folders,
+          folderListComplete: snapshot.folderListComplete,
           emails: snapshot.emails,
           syncedAt: snapshot.syncedAt,
           folderStats: snapshot.folderStats,

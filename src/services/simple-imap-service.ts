@@ -1,5 +1,5 @@
-import { realpathSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { open, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { ImapFlow, type FetchMessageObject, type ListResponse, type SearchObject } from "imapflow";
 import { simpleParser, type ParsedMail } from "mailparser";
@@ -41,6 +41,7 @@ import {
   stripHtmlToText,
   summarizeCalendarText,
 } from "../utils/helpers.js";
+import { preparePrivateOutput, writePrivateFile } from "../utils/private-file.js";
 import { logger, type Logger } from "../utils/logger.js";
 import { ensureAccountIdentityMatches } from "../utils/account-identity.js";
 
@@ -308,6 +309,7 @@ export function pickNewestUids(dated: { uid: number; date: number }[], limit: nu
 }
 
 export interface FolderSyncPlan {
+  reconcileToUid?: number;
   folder: string;
   strategy: MailboxSyncCheckpoint["strategy"];
   changed: boolean;
@@ -357,32 +359,25 @@ export function planFolderSync(input: {
     const priorFloor = uidValidityMatches ? input.checkpoint?.backfilledToUid : undefined;
 
     if (priorFloor !== undefined && priorFloor <= 1) {
-      // Already backfilled all the way back to UID 1 in a previous call.
-      // History is fully covered, but full:true must still surface mail
-      // that arrived *after* backfill completed — otherwise, once a folder
-      // finishes backfilling, full:true silently stops discovering any new
-      // mail forever, even as highestKnownUid keeps growing. Top up with a
-      // bounded fetch of just the newly-arrived range.
       const priorHighest = input.checkpoint?.highestUid ?? 0;
-      if (highestKnownUid <= priorHighest) {
+      if (highestKnownUid > priorHighest) {
+        const startUid = Math.max(priorHighest, input.checkpoint?.incrementalResumeUid ?? 0) + 1;
+        const endUid = Math.min(highestKnownUid, startUid + input.limit - 1);
         return {
-          folder: input.folder,
-          strategy: "full",
-          changed: false,
-          highestKnownUid,
-          backfilledToUid: priorFloor,
+          folder: input.folder, strategy: "full", changed: true, startUid, endUid,
+          highestKnownUid, backfilledToUid: priorFloor,
+          incrementalResumeUid: endUid < highestKnownUid ? endUid : undefined,
+          reconcileToUid: input.checkpoint?.reconcileToUid,
         };
       }
-
-      const topUpStart = Math.max(1, priorHighest + 1, highestKnownUid - input.limit + 1);
+      // Initial backfill is complete, but old UIDs can still be expunged or
+      // have flags changed. Cycle through bounded historical windows forever.
+      const cursor = input.checkpoint?.reconcileToUid;
+      const endUid = cursor && cursor > 1 ? Math.min(cursor - 1, highestKnownUid) : highestKnownUid;
+      const startUid = Math.max(1, endUid - input.limit + 1);
       return {
-        folder: input.folder,
-        strategy: "full",
-        changed: true,
-        startUid: topUpStart,
-        endUid: highestKnownUid,
-        highestKnownUid,
-        backfilledToUid: priorFloor,
+        folder: input.folder, strategy: "full", changed: true, startUid, endUid,
+        highestKnownUid, backfilledToUid: priorFloor, reconcileToUid: startUid,
       };
     }
 
@@ -655,21 +650,22 @@ export class SimpleIMAPService {
   }
 
   async disconnect(): Promise<void> {
-    if (!this.client) {
-      return;
-    }
-
+    const client = this.client;
+    if (!client) return;
+    this.client = undefined;
+    let timer: NodeJS.Timeout | undefined;
     try {
-      if (this.client.usable) {
-        await this.client.logout();
-      } else {
-        this.client.close();
+      if (client.usable) {
+        await Promise.race([
+          client.logout(),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, 1000); timer.unref?.(); }),
+        ]);
       }
     } catch (error) {
       this.log.warn("IMAP disconnect failed", "IMAPService", error);
-      this.client.close();
     } finally {
-      this.client = undefined;
+      clearTimeout(timer);
+      client.close();
     }
   }
 
@@ -1077,7 +1073,7 @@ export class SimpleIMAPService {
     this.folderCache = undefined;
     for (const [id, cached] of this.messageCache) {
       if (cached.folder === response.path) {
-        this.messageCache.delete(id);
+        this.evictMessage(id);
       }
     }
     const folders = await this.getFolders(true);
@@ -1137,7 +1133,7 @@ export class SimpleIMAPService {
     this.folderCache = undefined;
     for (const [id, cached] of this.messageCache) {
       if (cached.folder === response.path) {
-        this.messageCache.delete(id);
+        this.evictMessage(id);
       }
     }
     await this.getFolders(true);
@@ -1192,7 +1188,7 @@ export class SimpleIMAPService {
               ? await this.enrichSummaryFromParsed(summary, await this.parseSource(message.source), false)
               : summary;
           emails.push(enriched);
-          this.messageCache.set(enriched.id, enriched);
+          this.cacheMessage(enriched.id, enriched);
           this.capMessageCache();
         }
       } else {
@@ -1221,7 +1217,7 @@ export class SimpleIMAPService {
               ? await this.enrichSummaryFromParsed(summary, await this.parseSource(message.source), false)
               : summary;
           emails.push(enriched);
-          this.messageCache.set(enriched.id, enriched);
+          this.cacheMessage(enriched.id, enriched);
           this.capMessageCache();
         }
       }
@@ -1308,7 +1304,7 @@ export class SimpleIMAPService {
                 ? await this.enrichSummaryFromParsed(summary, await this.parseSource(message.source), false)
                 : summary;
             results.push(enriched);
-            this.messageCache.set(enriched.id, enriched);
+            this.cacheMessage(enriched.id, enriched);
             this.capMessageCache();
           }
           return { results, moreRemain: false };
@@ -1368,7 +1364,7 @@ export class SimpleIMAPService {
               input.includeSnippet && message.source
                 ? await this.enrichSummaryFromParsed(summary, await this.parseSource(message.source), false)
                 : summary;
-            this.messageCache.set(enriched.id, enriched);
+            this.cacheMessage(enriched.id, enriched);
             this.capMessageCache();
             if (matchesLocalSearchFilters(enriched, input)) {
               results.push(enriched);
@@ -1555,7 +1551,11 @@ export class SimpleIMAPService {
   ): Promise<AttachmentContentResult> {
     await this.assertAttachmentWithinInlineLimit(emailId, attachmentId);
     const attachment = await this.getParsedAttachment(emailId, attachmentId);
-    const base64 = attachment.content.toString("base64");
+    const maxBytes = (this.config.runtime.maxInlineBytes ?? 40) * 1024;
+    if (includeBase64 && attachment.content.length > maxBytes) {
+      throw new Error("Attachment too large for inline delivery. Use saveTo instead.");
+    }
+    const base64 = includeBase64 ? attachment.content.toString("base64") : undefined;
 
     return {
       emailId,
@@ -1806,10 +1806,10 @@ export class SimpleIMAPService {
     );
 
     const cached = this.messageCache.get(emailId);
-    this.messageCache.delete(emailId);
+    this.evictMessage(emailId);
     const targetEmailId = targetUid ? createEmailId(targetFolder, targetUid, targetFolderUidValidity) : undefined;
     if (cached && targetUid && targetEmailId) {
-      this.messageCache.set(targetEmailId, {
+      this.cacheMessage(targetEmailId, {
         ...cached,
         id: targetEmailId,
         folder: targetFolder,
@@ -1871,7 +1871,7 @@ export class SimpleIMAPService {
       `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms deleting email ${emailId}`,
     );
 
-    this.messageCache.delete(emailId);
+    this.evictMessage(emailId);
     // Deletion changes the folder's message count — see the markEmailRead
     // comment above for the same previously-missing invalidation.
     this.folderCache = undefined;
@@ -1895,7 +1895,8 @@ export class SimpleIMAPService {
     // uidValidity is what actually protects this call, the parameter only
     // tightens it further.
     const { folder, uid, uidValidity: idUidValidity } = parseEmailId(emailId);
-    const expectedUidValidity = uidValidity ?? idUidValidity;
+    let expectedUidValidity = uidValidity ?? idUidValidity;
+    let sourceDigest: string | undefined;
     const added: string[] = [];
     const removed: string[] = [];
     const notFound: string[] = [];
@@ -1917,10 +1918,12 @@ export class SimpleIMAPService {
     await this.withTimeout(
       this.withMailbox(folder, true, async (client) => {
         this.assertMailboxUidValidity(client, expectedUidValidity);
-        const msg = await client.fetchOne(String(uid), { uid: true, envelope: true }, { uid: true });
+        expectedUidValidity ??= (client.mailbox || undefined)?.uidValidity?.toString();
+        const msg = await client.fetchOne(String(uid), { uid: true, envelope: true, source: labelsToRemove.length > 0 }, { uid: true });
         if (msg !== false) {
           sourceExists = true;
           messageId = msg.envelope?.messageId;
+          if (msg.source) sourceDigest = createHash("sha256").update(msg.source).digest("hex");
         }
       }),
       BULK_ITEM_TIMEOUT_MS,
@@ -1936,6 +1939,7 @@ export class SimpleIMAPService {
       try {
         await this.withTimeout(
           this.withMailbox(folder, false, async (client) => {
+            this.assertMailboxUidValidity(client, expectedUidValidity);
             const result = await client.messageCopy(String(uid), labelFolder, { uid: true });
             if (result === false) {
               throw new Error(`Server did not copy message to ${labelFolder}`);
@@ -1945,7 +1949,8 @@ export class SimpleIMAPService {
           `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms copying ${emailId} to ${labelFolder}`,
         );
         added.push(labelFolder);
-      } catch {
+      } catch (error) {
+        if (error instanceof Error && error.message === UID_VALIDITY_MISMATCH_ERROR) throw error;
         notFound.push(labelFolder);
         failedLabels.push(labelFolder);
       }
@@ -1958,13 +1963,11 @@ export class SimpleIMAPService {
         if (messageId) {
           const deleted = await this.withTimeout(
             this.withMailbox(labelFolder, false, async (client) => {
-              const uids = await client.search({ header: { "Message-ID": messageId! } }, { uid: true });
-              const labelUid = Array.isArray(uids) ? uids[0] : undefined;
+              const labelUid = await this.resolveExactLabelUid(client, messageId!, sourceDigest);
               if (!labelUid) {
                 return false;
               }
-              await client.messageDelete(String(labelUid), { uid: true });
-              return true;
+              return Boolean(await client.messageDelete(String(labelUid), { uid: true }));
             }),
             BULK_ITEM_TIMEOUT_MS,
             `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms removing ${emailId} from ${labelFolder}`,
@@ -2042,7 +2045,7 @@ export class SimpleIMAPService {
     const appliedSomething = flagsToAdd.some((f) => !notApplied.includes(f))
       || flagsToRemove.some((f) => !notApplied.includes(f));
     if (appliedSomething) {
-      this.messageCache.delete(emailId);
+      this.evictMessage(emailId);
     }
     return { emailId, added: flagsToAdd, removed: flagsToRemove, notApplied };
   }
@@ -2121,6 +2124,7 @@ export class SimpleIMAPService {
     const uidSet = uids.join(",");
     await this.withTimeout(
       this.withMailbox(folder, false, async (client) => {
+        this.assertMailboxUidValidity(client, folderUidValidity);
         await client.messageDelete(uidSet, { uid: true });
       }),
       BULK_ITEM_TIMEOUT_MS,
@@ -2131,7 +2135,7 @@ export class SimpleIMAPService {
     // would have cached these messages under (including the folder's
     // UIDVALIDITY at the time), or a stale cache entry survives this purge.
     for (const uid of uids) {
-      this.messageCache.delete(createEmailId(folder, uid, folderUidValidity));
+      this.evictMessage(createEmailId(folder, uid, folderUidValidity));
     }
     this.folderCache = undefined;
 
@@ -2324,7 +2328,7 @@ export class SimpleIMAPService {
             failed++;
             continue;
           }
-          this.messageCache.delete(emailId);
+          this.evictMessage(emailId);
           results.push({ uid, emailId, ok: true });
           succeeded++;
         }
@@ -2443,7 +2447,7 @@ export class SimpleIMAPService {
             failed++;
             continue;
           }
-          this.messageCache.delete(emailId);
+          this.evictMessage(emailId);
           results.push({ uid, emailId, ok: true });
           succeeded++;
         }
@@ -2829,7 +2833,7 @@ export class SimpleIMAPService {
           BULK_ITEM_TIMEOUT_MS,
           `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms moving uid ${uid} for thread ${input.messageId}`,
         );
-        this.messageCache.delete(emailId);
+        this.evictMessage(emailId);
         moved++;
       } catch {
         notMoved++;
@@ -2888,7 +2892,7 @@ export class SimpleIMAPService {
           BULK_ITEM_TIMEOUT_MS,
           `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms deleting uid ${uid} for thread ${input.messageId}`,
         );
-        this.messageCache.delete(emailId);
+        this.evictMessage(emailId);
         deleted++;
       } catch { /* best-effort */ }
     }
@@ -2977,6 +2981,7 @@ export class SimpleIMAPService {
     syncedAt: string;
     full: boolean;
     folders: FolderInfo[];
+    folderListComplete: boolean;
     folderStats: Array<MailboxSyncCheckpoint>;
     emails: EmailSummary[];
   }> {
@@ -3004,6 +3009,7 @@ export class SimpleIMAPService {
     return {
       syncedAt,
       full,
+      folderListComplete: true,
       folders: await this.getFolders(true),
       folderStats,
       emails,
@@ -3057,6 +3063,7 @@ export class SimpleIMAPService {
             backfilledToUid: plan.backfilledToUid,
             folderObservedEmpty: plan.folderObservedEmpty,
             incrementalResumeUid: plan.incrementalResumeUid,
+            reconcileToUid: plan.reconcileToUid,
           },
           emails: [],
         };
@@ -3077,7 +3084,7 @@ export class SimpleIMAPService {
           ? this.enrichSummaryFromParsed(summary, await this.parseSource(message.source), input.includeAttachmentText)
           : summary;
         emails.push(enriched);
-        this.messageCache.set(enriched.id, enriched);
+        this.cacheMessage(enriched.id, enriched);
         this.capMessageCache();
       }
 
@@ -3115,6 +3122,7 @@ export class SimpleIMAPService {
           rangeEndUid: plan.endUid,
           backfilledToUid: plan.backfilledToUid,
           incrementalResumeUid: plan.incrementalResumeUid,
+          reconcileToUid: plan.reconcileToUid,
         },
         emails,
       };
@@ -3186,6 +3194,8 @@ export class SimpleIMAPService {
     const clearedMessages = this.messageCache.size;
     const clearedFolders = Boolean(this.folderCache);
     this.messageCache.clear();
+    this.messageCacheSizes.clear();
+    this.messageCacheBytes = 0;
     this.folderCache = undefined;
     this.lastSyncAt = undefined;
 
@@ -3481,6 +3491,7 @@ export class SimpleIMAPService {
     const attachments = extractAttachments(message.bodyStructure);
 
     return {
+      detailsComplete: false,
       id: createEmailId(folder, message.uid, uidValidity),
       folder,
       uid: message.uid,
@@ -3524,6 +3535,7 @@ export class SimpleIMAPService {
 
     return {
       ...summary,
+      detailsComplete: true,
       subject: parsed.subject || summary.subject,
       from: parsed.from ? mapParsedAddresses(parsed.from) : summary.from,
       to: parsed.to ? mapParsedAddresses(parsed.to) : summary.to,
@@ -3542,6 +3554,7 @@ export class SimpleIMAPService {
   }
 
   private async parseSource(source: Buffer): Promise<ParsedMail> {
+    if (source.length > 64 * 1024 * 1024) throw new Error("Message source exceeds the 64 MiB parsing limit.");
     return simpleParser(source);
   }
 
@@ -3551,7 +3564,7 @@ export class SimpleIMAPService {
   }> {
     const { folder, uid, uidValidity: expectedUidValidity } = parseEmailId(emailId);
 
-    const { enriched, parsed } = await this.withTimeout(
+    const { enriched, parsed, sourceDigest } = await this.withTimeout(
       this.withMailbox(folder, true, async (client) => {
         // UIDs can be reused after mailbox recreation (UIDVALIDITY change).
         // This backs content reads used for quoting/forwarding/replying, so a
@@ -3573,7 +3586,7 @@ export class SimpleIMAPService {
         const summary = this.toSummary(folder, message, (client.mailbox || undefined)?.uidValidity?.toString());
         const parsed = await this.parseSource(message.source);
         const enriched = this.enrichSummaryFromParsed(summary, parsed, true);
-        return { enriched, parsed };
+        return { enriched, parsed, sourceDigest: createHash("sha256").update(message.source).digest("hex") };
       }),
       BULK_ITEM_TIMEOUT_MS,
       `Timed out after ${BULK_ITEM_TIMEOUT_MS}ms fetching email ${emailId}`,
@@ -3595,7 +3608,7 @@ export class SimpleIMAPService {
     // to select other folders on that same client — calling it from inside
     // the outer withMailbox's callback deadlocked (found immediately, live,
     // the very first time this ran: `read` never returned).
-    const resolvedLabels = await this.resolveMessageLabels(enriched.messageId, folder);
+    const resolvedLabels = await this.resolveMessageLabels(enriched.messageId, folder, sourceDigest);
     const detail: EmailDetail = {
       ...enriched,
       labels: resolvedLabels.length > 0 ? resolvedLabels : enriched.labels,
@@ -3613,12 +3626,22 @@ export class SimpleIMAPService {
       headers: this.mapHeaders(parsed),
     };
 
-    this.messageCache.set(detail.id, detail);
+    this.cacheMessage(detail.id, detail);
     this.capMessageCache();
     return { detail, parsed };
   }
 
-  private async resolveMessageLabels(messageId: string | undefined, ownFolder: string): Promise<string[]> {
+  private async resolveExactLabelUid(client: ImapFlow, messageId: string, sourceDigest?: string): Promise<number | undefined> {
+    if (!sourceDigest) return undefined;
+    const uids = await client.search({ header: { "Message-ID": messageId } }, { uid: true });
+    if (!Array.isArray(uids) || uids.length !== 1) return undefined;
+    const candidate = await client.fetchOne(String(uids[0]), { uid: true, envelope: true, source: true }, { uid: true });
+    if (!candidate || !candidate.source || candidate.envelope?.messageId !== messageId) return undefined;
+    if (createHash("sha256").update(candidate.source).digest("hex") !== sourceDigest) return undefined;
+    return uids[0];
+  }
+
+  private async resolveMessageLabels(messageId: string | undefined, ownFolder: string, sourceDigest?: string): Promise<string[]> {
     if (!messageId) {
       return [];
     }
@@ -3649,8 +3672,7 @@ export class SimpleIMAPService {
       try {
         const found = await this.withTimeout(
           this.withMailbox(labelFolder, true, async (client) => {
-            const uids = await client.search({ header: { "Message-ID": messageId } }, { uid: true });
-            return Array.isArray(uids) && uids.length > 0;
+            return Boolean(await this.resolveExactLabelUid(client, messageId, sourceDigest));
           }),
           LABEL_RESOLVE_PER_FOLDER_TIMEOUT_MS,
           `Timed out after ${LABEL_RESOLVE_PER_FOLDER_TIMEOUT_MS}ms resolving label ${labelFolder}`,
@@ -3796,7 +3818,26 @@ export class SimpleIMAPService {
       return;
     }
 
-    this.messageCache.set(emailId, updater(cached));
+    this.cacheMessage(emailId, updater(cached));
+    this.capMessageCache();
+  }
+
+  private readonly messageCacheSizes = new Map<string, number>();
+  private messageCacheBytes = 0;
+
+  private evictMessage(id: string): void {
+    this.messageCacheBytes -= this.messageCacheSizes.get(id) ?? 0;
+    this.messageCacheSizes.delete(id);
+    this.messageCache.delete(id);
+  }
+
+  private cacheMessage(id: string, message: EmailSummary): void {
+    this.evictMessage(id);
+    const bytes = Buffer.byteLength(JSON.stringify(message));
+    if (bytes > 64 * 1024 * 1024) return;
+    this.messageCache.set(id, message);
+    this.messageCacheSizes.set(id, bytes);
+    this.messageCacheBytes += bytes;
     this.capMessageCache();
   }
 
@@ -3805,10 +3846,10 @@ export class SimpleIMAPService {
   // LRU well enough for a bound, not a strict LRU (there's no read-time
   // promotion elsewhere in this cache).
   private capMessageCache(): void {
-    while (this.messageCache.size > MAX_MESSAGE_CACHE_SIZE) {
+    while (this.messageCache.size > MAX_MESSAGE_CACHE_SIZE || this.messageCacheBytes > 64 * 1024 * 1024) {
       const oldestKey = this.messageCache.keys().next().value;
       if (oldestKey === undefined) break;
-      this.messageCache.delete(oldestKey);
+      this.evictMessage(oldestKey);
     }
   }
 
@@ -3986,7 +4027,9 @@ export class SimpleIMAPService {
       ]);
     } catch (error) {
       if (timedOut) {
-        await this.disconnect().catch(() => {});
+        const client = this.client;
+        this.client = undefined;
+        client?.close();
       }
       throw error;
     } finally {
@@ -4051,14 +4094,12 @@ export class SimpleIMAPService {
       const dirPath = join(this.config.dataDir, "attachments", encodeURIComponent(emailId));
       // 0o700/0o600: this writes the user's own private email content — restrict
       // it to the owner regardless of the destination directory's own permissions.
-      await mkdir(dirPath, { recursive: true, mode: 0o700 });
       outputFilePath = await this.writeAttachmentUnique(dirPath, filename, attachment.content);
     } else {
       outputFilePath = await this.resolveAttachmentOutputPath(emailId, attachment, outputPath);
       // 0o700/0o600: this writes the user's own private email content — restrict
       // it to the owner regardless of the destination directory's own permissions.
-      await mkdir(dirname(outputFilePath), { recursive: true, mode: 0o700 });
-      await writeFile(outputFilePath, attachment.content, { mode: 0o600 });
+      await writePrivateFile(this.downloadDirectory(), outputFilePath, attachment.content);
     }
 
     return {
@@ -4096,7 +4137,7 @@ export class SimpleIMAPService {
     let candidateName = filename;
     let counter = 0;
     for (;;) {
-      const candidatePath = join(dirPath, candidateName);
+      const candidatePath = await preparePrivateOutput(this.config.dataDir, join(dirPath, candidateName));
       try {
         const handle = await open(candidatePath, "wx", 0o600);
         try {
@@ -4116,45 +4157,23 @@ export class SimpleIMAPService {
     }
   }
 
-  // Returns the validated real path so callers write through the same
-  // resolved path they just checked, instead of re-deriving it — re-deriving
-  // left a TOCTOU window where a symlink swapped in between validation and
-  // write could redirect the write outside allowDir even though the check
-  // passed. Returning the already-realpath'd path collapses that into the
-  // single unavoidable race between this check and the actual write.
-  private guardAttachmentOutputPath(outputPath: string): string {
-    const allowDir = process.env.PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR?.trim();
-    if (!allowDir) {
-      throw new Error("outputPath requires PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR to be configured.");
-    }
+  private downloadDirectory(): string {
+    const directory = this.config.runtime.allowFileDownloadDir ?? process.env.PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR?.trim();
+    if (!directory) throw new Error("outputPath requires PROTONMAIL_ALLOW_FILE_DOWNLOAD_DIR to be configured.");
+    return directory;
+  }
 
-    const targetPath = resolve(outputPath);
-    const allowedRealPath = realpathSync(resolve(allowDir));
-    let targetRealPath: string;
-    try {
-      targetRealPath = realpathSync(targetPath);
-    } catch (error) {
-      if (
-        error &&
-        typeof error === "object" &&
-        "code" in error &&
-        (error as { code?: string }).code === "ENOENT"
-      ) {
-        try {
-          targetRealPath = realpathSync(dirname(targetPath)) + sep + basename(targetPath);
-        } catch {
-          throw new Error(`Output directory does not exist: ${dirname(targetPath)}`);
-        }
-      } else {
-        throw error;
-      }
-    }
+  private guardAttachmentOutputPath(outputPath: string): Promise<string> {
+    return preparePrivateOutput(this.downloadDirectory(), outputPath);
+  }
 
-    if (!targetRealPath.startsWith(`${allowedRealPath}${sep}`) && targetRealPath !== allowedRealPath) {
-      throw new Error("outputPath path escapes the allowed directory.");
-    }
-
-    return targetRealPath;
+  async saveAttachmentToDownload(emailId: string, attachmentId: string, saveTo: string): Promise<Record<string, unknown>> {
+    const root = this.downloadDirectory();
+    const target = resolve(root, saveTo);
+    await preparePrivateOutput(root, target);
+    const attachment = await this.getParsedAttachment(emailId, attachmentId);
+    const path = await writePrivateFile(root, target, attachment.content);
+    return { saved: true, path, bytes: attachment.content.length, filename: attachment.filename };
   }
 
   private async resolveAttachmentOutputPath(
@@ -4225,8 +4244,9 @@ export class SimpleIMAPService {
     // 0o700/0o600: same reasoning as writeAttachmentToPath above — this is
     // the user's own private email content, regardless of where they chose
     // to save it.
-    await mkdir(dirname(resolvedPath), { recursive: true, mode: 0o700 });
-    await writeFile(resolvedPath, source, { mode: 0o600 });
+    if (!outputPath) await ensureAccountIdentityMatches(this.config.dataDir, this.config.smtp.username);
+    const root = outputPath ? this.downloadDirectory() : this.config.dataDir;
+    await writePrivateFile(root, resolvedPath, source);
 
     return { emailId, outputPath: basename(resolvedPath) };
   }

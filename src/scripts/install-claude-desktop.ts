@@ -4,6 +4,7 @@ import { access, copyFile, cp, mkdir, readFile, rm, writeFile } from "node:fs/pr
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { writePrivateFile } from "../utils/private-file.js";
 import { promisify } from "node:util";
 
 const DEFAULT_SERVER_NAME = "proton-mail-bridge";
@@ -362,7 +363,7 @@ async function backupConfigIfPresent(configPath: string): Promise<string | undef
   try {
     await access(configPath, fsConstants.F_OK);
     const backupPath = `${configPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-    await copyFile(configPath, backupPath);
+    await writePrivateFile(dirname(configPath), backupPath, await readFile(configPath));
     return backupPath;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "ENOENT") {
@@ -390,9 +391,9 @@ export async function installClaudeDesktopConfig(options: InstallOptions = {}): 
   });
   const merged = mergeClaudeDesktopConfig(existing, serverName, serverConfig);
 
-  await mkdir(dirname(configPath), { recursive: true });
+  await mkdir(dirname(configPath), { recursive: true, mode: 0o700 });
   const backupPath = await backupConfigIfPresent(configPath);
-  await writeFile(configPath, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+  await writePrivateFile(dirname(configPath), configPath, `${JSON.stringify(merged, null, 2)}\n`);
 
   return {
     configPath,
@@ -405,10 +406,15 @@ export async function installClaudeDesktopConfig(options: InstallOptions = {}): 
   };
 }
 
+export function installStatusForOutput(result: Awaited<ReturnType<typeof installClaudeDesktopConfig>>): Record<string, unknown> {
+  const { serverConfig: _credentials, ...status } = result;
+  return status;
+}
+
 async function main(): Promise<void> {
   const options = parseCliArgs(process.argv.slice(2));
   const result = await installClaudeDesktopConfig(options);
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(installStatusForOutput(result), null, 2)}\n`);
 }
 
 const isDirectExecution =

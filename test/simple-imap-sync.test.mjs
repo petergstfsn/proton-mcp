@@ -192,7 +192,7 @@ test("planFolderSync full:true continues backfilling older than the last window 
   assert.equal(plan.backfilledToUid, 44750);
 });
 
-test("planFolderSync full:true reports no more work once backfilled to UID 1 and no new mail arrived", () => {
+test("planFolderSync full:true starts bounded historical reconciliation after backfill", () => {
   const plan = planFolderSync({
     folder: "Archive",
     exists: 22871,
@@ -209,8 +209,10 @@ test("planFolderSync full:true reports no more work once backfilled to UID 1 and
   });
 
   assert.equal(plan.strategy, "full");
-  assert.equal(plan.changed, false);
-  assert.equal(plan.startUid, undefined);
+  assert.equal(plan.changed, true);
+  assert.equal(plan.startUid, 45250);
+  assert.equal(plan.endUid, 45749);
+  assert.equal(plan.reconcileToUid, 45250);
   assert.equal(plan.backfilledToUid, 1);
 });
 

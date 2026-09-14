@@ -104,11 +104,9 @@ proton-mail-bridge-client doctor
 proton-mail-bridge-client status
 proton-mail-bridge-client sync --folder INBOX --limit 150
 
-# --full also detects and prunes messages no longer in this folder (moved,
-# archived, trashed, or deleted by any client) — the default incremental sync
-# only ever adds/updates messages, so a trashed email can keep showing up in
-# search/digest/thread results indefinitely without this. Sync each folder
-# you want cleaned up.
+# Each successful sync reconciles deletions within the fetched UID range.
+# Repeated --full calls cycle through bounded historical windows after backfill,
+# so old deletions are eventually reconciled too. One call is not a full rescan.
 proton-mail-bridge-client sync --folder INBOX --full
 ```
 

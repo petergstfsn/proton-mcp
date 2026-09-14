@@ -42,7 +42,7 @@ Give Claude Desktop (or Cline, or any MCP client) full access to your Proton Mai
 
 Your emails travel: **Proton Mail → Proton Bridge (local) → this server (local) → your AI client**.
 
-Nothing goes through a third-party email relay. Proton Bridge decrypts your mail locally; this server reads it over a local IMAP connection on `127.0.0.1`. The AI model (Claude Desktop, Cline, etc.) sees the email content you ask it to act on — that's the whole point — but no email leaves your machine except through your own Proton account when you send.
+Nothing goes through a third-party email relay. Proton Bridge decrypts your mail locally; this server reads it over a local IMAP connection on `127.0.0.1`. The AI client sees the email content you request. A cloud-backed client can transmit that content to its model provider; local Bridge transport does not make cloud model processing local.
 
 If you use Claude Desktop with the default Anthropic API, conversation content (including email snippets) is sent to Anthropic per their [privacy policy](https://www.anthropic.com/privacy). If you self-host an LLM or use a local-only Claude setup, nothing leaves your machine at all.
 
@@ -498,3 +498,17 @@ Bug reports and pull requests welcome: [github.com/googlarz/proton-mail-bridge-c
 ## License
 
 MIT
+
+### Audit hardening and compatibility
+
+CLI reply/forward honor self-only delivery, confirmation and `--dry-run`. Generic system flags enforce the matching read/star/delete/restore action permission. Labels, folders and custom keywords remain governed by read-only mode, since they are not EmailAction values. Marking a message `\Deleted` also requires destructive confirmation when enabled.
+
+Download destinations must be inside the configured root, with real parent directories owned by the running user and not writable by other users on POSIX. Ancestors must also be owned by the user or system and protected against replacement; trusted sticky temporary directories are supported. Missing download directories are created privately. Symlink destinations are rejected. Explicit saves atomically replace regular files with private files; default attachment saves retain collision suffixes. Windows relies on the selected directory's ACL. Other processes running as the credential owner are outside this isolation boundary.
+
+After SMTP begins, an uncertain failure leaves a source draft non-sendable. Check the Sent mailbox and reconcile delivery before making a new draft. Do not automatically retry an ambiguous delivery. Queued sends still require a running server.
+
+Repeated full syncs perform bounded historical reconciliation after initial backfill; one full call is not a complete rescan. Message parsing is capped at 64 MiB and the message cache at 64 MiB of serialized content as well as 5,000 entries. Thread-reference traversal is iterative. Authentication headers are displayed as unverified observations, not proof of sender identity. Label removal requires an unambiguous exact source match and can refuse messages whose Bridge representation differs between folders.
+
+Legacy IDs cannot prove the original mailbox generation; obtain fresh IDs before mutations. A markerless legacy data directory adopts the configured account, so verify its ownership before upgrading or use a fresh account-specific directory.
+
+This repository retains the upstream npm package name and MCP namespace for compatibility. The checked-in Homebrew formula installs the explicitly pinned upstream archive; it does not contain unpublished fork changes. Install this checkout from source to test this branch. Fork npm publishing is disabled until a separately authorized release configures an owned package and namespace. The unused, unresolvable homebrew-tap gitlink has been removed; the maintained formula is in `homebrew/`.

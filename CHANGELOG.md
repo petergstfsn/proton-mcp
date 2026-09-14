@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [Unreleased]
+
+### Fixed
+- Enforce action permissions across alternate MCP/CLI mutations and self-only, confirmation and dry-run controls on CLI replies and forwards.
+- Keep drafts non-sendable after ambiguous SMTP outcomes or delivery bookkeeping failures.
+- Save decrypted output and installer credentials privately, reject unsafe filesystem destinations, redact installer output, and enforce actual inline attachment limits.
+- Preserve parsed index details across metadata refreshes and legacy-ID migration; resume full-sync arrival gaps and reconcile observed expunges and deleted folders.
+- Bound IMAP shutdown, message parsing/cache size and thread traversal; verify exact label content and mutation mailbox generations.
+- Repair Docker source inclusion, the Homebrew archive digest, release metadata, privacy copy and cron examples. Add runtime/container CI and audit regressions.
+
+See [audit remediation](docs/audit-remediation.md) for coverage and compatibility limits. These fork changes are not yet published to npm or Homebrew.
+
 ## [2.0.8] — 2026-09-09
 
 ### Fixed

@@ -602,6 +602,7 @@ export class LocalIndexService {
 
   async recordSnapshot(input: {
     folders: FolderInfo[];
+    folderListComplete?: boolean;
     emails: EmailSummary[];
     syncedAt: string;
     folderStats: Array<MailboxSyncCheckpoint>;
@@ -1660,6 +1661,7 @@ export class LocalIndexService {
     db: Database.Database,
     input: {
       folders: FolderInfo[];
+      folderListComplete?: boolean;
       emails: EmailSummary[];
       syncedAt: string;
       folderStats: Array<MailboxSyncCheckpoint>;
@@ -1707,8 +1709,8 @@ export class LocalIndexService {
         seq = excluded.seq,
         message_id = excluded.message_id,
         in_reply_to = excluded.in_reply_to,
-        references_json = excluded.references_json,
-        thread_id = excluded.thread_id,
+        references_json = CASE WHEN @metadata_only THEN messages.references_json ELSE excluded.references_json END,
+        thread_id = CASE WHEN @metadata_only THEN messages.thread_id ELSE excluded.thread_id END,
         subject = excluded.subject,
         from_json = excluded.from_json,
         to_json = excluded.to_json,
@@ -1726,8 +1728,8 @@ export class LocalIndexService {
         -- UID is immutable — only flags change — so preserving the existing
         -- indexed value here is always correct, never stale.
         preview = COALESCE(excluded.preview, messages.preview),
-        has_attachments = excluded.has_attachments,
-        attachments_json = excluded.attachments_json,
+        has_attachments = CASE WHEN @metadata_only THEN messages.has_attachments ELSE excluded.has_attachments END,
+        attachments_json = CASE WHEN @metadata_only THEN messages.attachments_json ELSE excluded.attachments_json END,
         attachment_text = COALESCE(excluded.attachment_text, messages.attachment_text),
         labels_json = excluded.labels_json,
         -- Same reasoning: a flags-only refresh fetches no headers, so is_automated arrives
@@ -1737,9 +1739,9 @@ export class LocalIndexService {
     `);
     const upsertSyncState = db.prepare(`
       INSERT INTO sync_state (
-        folder, uid_validity, uid_next, highest_uid, last_sync_at, last_full_sync_at, strategy, changed, fetched, total, backfilled_to_uid, incremental_resume_uid
+        folder, uid_validity, uid_next, highest_uid, last_sync_at, last_full_sync_at, strategy, changed, fetched, total, backfilled_to_uid, incremental_resume_uid, reconcile_to_uid
       ) VALUES (
-        @folder, @uid_validity, @uid_next, @highest_uid, @last_sync_at, @last_full_sync_at, @strategy, @changed, @fetched, @total, @backfilled_to_uid, @incremental_resume_uid
+        @folder, @uid_validity, @uid_next, @highest_uid, @last_sync_at, @last_full_sync_at, @strategy, @changed, @fetched, @total, @backfilled_to_uid, @incremental_resume_uid, @reconcile_to_uid
       )
       ON CONFLICT(folder) DO UPDATE SET
         uid_validity = excluded.uid_validity,
@@ -1752,7 +1754,8 @@ export class LocalIndexService {
         fetched = excluded.fetched,
         total = excluded.total,
         backfilled_to_uid = excluded.backfilled_to_uid,
-        incremental_resume_uid = excluded.incremental_resume_uid
+        incremental_resume_uid = excluded.incremental_resume_uid,
+        reconcile_to_uid = excluded.reconcile_to_uid
     `);
 
     const deleteFts = db.prepare(`DELETE FROM messages_fts WHERE email_id = ?`);
@@ -1773,7 +1776,7 @@ export class LocalIndexService {
     // exact old-format id (computed directly from folder+uid, not searched
     // for), so it's a cheap indexed PK read on every sync and, once the old
     // row is migrated away below, a cheap negative lookup forever after.
-    const findLegacyRow = db.prepare(`SELECT preview, attachment_text FROM messages WHERE email_id = ?`);
+    const findLegacyRow = db.prepare(`SELECT preview, attachment_text, references_json, thread_id, has_attachments, attachments_json FROM messages WHERE email_id = ?`);
     const deleteLegacyRow = db.prepare(`DELETE FROM messages WHERE email_id = ?`);
     const setMetadata = db.prepare(`
       INSERT INTO metadata (key, value) VALUES (?, ?)
@@ -1796,6 +1799,18 @@ export class LocalIndexService {
       setMetadata.run("ownerEmail", ownerEmail || "");
       setMetadata.run("updatedAt", input.syncedAt);
       const foldersWithResetCheckpoint = new Set<string>();
+      if (input.folderListComplete) {
+        const listed = new Set(input.folders.map(folder => folder.path));
+        const storedFolders = db.prepare("SELECT path FROM folders").all() as Array<{ path: string }>;
+        for (const { path } of storedFolders) {
+          if (listed.has(path)) continue;
+          deleteFtsForFolder.run(path);
+          deleteMessagesForFolder.run(path);
+          db.prepare("DELETE FROM sync_state WHERE folder = ?").run(path);
+          db.prepare("DELETE FROM folders WHERE path = ?").run(path);
+        }
+      }
+
 
       for (const folderStat of input.folderStats) {
         const stored = getStoredSyncState.get(folderStat.folder) as { uid_validity?: string | null } | undefined;
@@ -1867,6 +1882,7 @@ export class LocalIndexService {
           total: folderStat.total ?? null,
           backfilled_to_uid: resetCheckpoint ? null : folderStat.backfilledToUid ?? null,
           incremental_resume_uid: resetCheckpoint ? null : folderStat.incrementalResumeUid ?? null,
+          reconcile_to_uid: resetCheckpoint ? null : folderStat.reconcileToUid ?? null,
         });
       }
 
@@ -1895,6 +1911,8 @@ export class LocalIndexService {
         // createEmailId's folder encoding but without a checksum suffix —
         // this is exactly what parseEmailId's legacy (no-checksum) branch
         // expects to parse back apart.
+        type LegacyDetails = { preview: string | null; attachment_text: string | null; references_json: string; thread_id: string | null; has_attachments: number; attachments_json: string };
+        let legacyDetails: LegacyDetails | undefined;
         let legacyPreview: string | null = null;
         let legacyAttachmentText: string | null = null;
         const legacyEmailId = createEmailId(email.folder, email.uid);
@@ -1907,9 +1925,10 @@ export class LocalIndexService {
         // duplicate, regardless of which (or both) exist.
         if (legacyEmailId !== email.id) {
           const legacyRow = findLegacyRow.get(legacyEmailId) as
-            | { preview: string | null; attachment_text: string | null }
+            | LegacyDetails
             | undefined;
           if (legacyRow) {
+            legacyDetails = legacyRow;
             legacyPreview = legacyRow.preview;
             legacyAttachmentText = legacyRow.attachment_text;
             deleteLegacyRow.run(legacyEmailId);
@@ -1918,9 +1937,10 @@ export class LocalIndexService {
         }
         if (legacyEmailId2Field !== email.id) {
           const legacyRow2Field = findLegacyRow.get(legacyEmailId2Field) as
-            | { preview: string | null; attachment_text: string | null }
+            | LegacyDetails
             | undefined;
           if (legacyRow2Field) {
+            legacyDetails ??= legacyRow2Field;
             legacyPreview = legacyPreview ?? legacyRow2Field.preview;
             legacyAttachmentText = legacyAttachmentText ?? legacyRow2Field.attachment_text;
             deleteLegacyRow.run(legacyEmailId2Field);
@@ -1940,14 +1960,15 @@ export class LocalIndexService {
         // ON CONFLICT's COALESCE never fires for it — legacyPreview/
         // legacyAttachmentText fill that role instead.
         const persisted = upsertMessage.get({
+          metadata_only: email.detailsComplete === false ? 1 : 0,
           email_id: email.id,
           folder: email.folder,
           uid: email.uid,
           seq: email.seq,
           message_id: email.messageId ?? null,
           in_reply_to: email.inReplyTo ?? null,
-          references_json: JSON.stringify(email.references ?? []),
-          thread_id: email.threadId ?? null,
+          references_json: email.detailsComplete === false && legacyDetails ? legacyDetails.references_json : JSON.stringify(email.references ?? []),
+          thread_id: email.detailsComplete === false && legacyDetails ? legacyDetails.thread_id : email.threadId ?? null,
           subject: email.subject,
           from_json: JSON.stringify(email.from),
           to_json: JSON.stringify(email.to),
@@ -1961,8 +1982,8 @@ export class LocalIndexService {
           flags_json: JSON.stringify(email.flags),
           size: email.size ?? null,
           preview: email.preview ?? legacyPreview,
-          has_attachments: email.hasAttachments ? 1 : 0,
-          attachments_json: JSON.stringify(email.attachments),
+          has_attachments: email.detailsComplete === false && legacyDetails ? legacyDetails.has_attachments : email.hasAttachments ? 1 : 0,
+          attachments_json: email.detailsComplete === false && legacyDetails ? legacyDetails.attachments_json : JSON.stringify(email.attachments),
           attachment_text: email.attachmentText ?? legacyAttachmentText,
           labels_json: JSON.stringify(email.labels),
           is_automated: email.isAutomated === undefined ? null : email.isAutomated ? 1 : 0,
@@ -1982,7 +2003,7 @@ export class LocalIndexService {
         );
       }
 
-      if (cleanupExpunged) {
+      {
         createSnapshotUidTable.run();
         const clearSnapshotUidTable = db.prepare(`DELETE FROM temp_snapshot_uids`);
         const insertSnapshotUid = db.prepare(`INSERT OR IGNORE INTO temp_snapshot_uids(uid) VALUES (?)`);
@@ -2014,7 +2035,7 @@ export class LocalIndexService {
         `);
         const rangesByFullSyncFolder = new Map<string, { uids: Set<number>; rangeStartUid: number; rangeEndUid: number }>();
         for (const folderStat of input.folderStats) {
-          if (folderStat.strategy === "full" && folderStat.rangeStartUid !== undefined && folderStat.rangeEndUid !== undefined) {
+          if (folderStat.rangeStartUid !== undefined && folderStat.rangeEndUid !== undefined) {
             rangesByFullSyncFolder.set(folderStat.folder, {
               uids: new Set<number>(),
               rangeStartUid: folderStat.rangeStartUid,
@@ -2160,6 +2181,9 @@ export class LocalIndexService {
     );
     if (!syncStateColumns.has("backfilled_to_uid")) {
       db.exec(`ALTER TABLE sync_state ADD COLUMN backfilled_to_uid INTEGER`);
+    }
+    if (!syncStateColumns.has("reconcile_to_uid")) {
+      db.exec(`ALTER TABLE sync_state ADD COLUMN reconcile_to_uid INTEGER`);
     }
     if (!syncStateColumns.has("incremental_resume_uid")) {
       db.exec(`ALTER TABLE sync_state ADD COLUMN incremental_resume_uid INTEGER`);
@@ -2416,7 +2440,7 @@ export class LocalIndexService {
   private loadCheckpointsSync(db: Database.Database): MailboxSyncCheckpoint[] {
     return db
       .prepare(`
-        SELECT folder, uid_validity, uid_next, highest_uid, last_sync_at, last_full_sync_at, strategy, changed, fetched, total, backfilled_to_uid, incremental_resume_uid
+        SELECT folder, uid_validity, uid_next, highest_uid, last_sync_at, last_full_sync_at, strategy, changed, fetched, total, backfilled_to_uid, incremental_resume_uid, reconcile_to_uid
         FROM sync_state
         ORDER BY folder ASC
       `)
@@ -2445,6 +2469,7 @@ export class LocalIndexService {
         // number as "resume from here" — a null read back as null (not undefined)
         // would be indistinguishable from a legitimate resume-at-0 edge case in
         // some comparisons, so map it away explicitly here too.
+        reconcileToUid: (row as { reconcile_to_uid?: number | null }).reconcile_to_uid ?? undefined,
         incrementalResumeUid: (row as { incremental_resume_uid?: number | null }).incremental_resume_uid ?? undefined,
       } satisfies MailboxSyncCheckpoint));
   }
@@ -2855,52 +2880,31 @@ export class LocalIndexService {
     );
     const resolvedKeys = new Map<string, string>();
 
-    const resolveThreadKey = (message: MailboxMessage, stack = new Set<string>()): string => {
-      if (resolvedKeys.has(message.canonicalId)) {
-        return resolvedKeys.get(message.canonicalId) as string;
+    const resolveThreadKey = (initial: MailboxMessage): string => {
+      const path: MailboxMessage[] = [];
+      const seen = new Set<string>();
+      let message = initial;
+      let key: string;
+      for (;;) {
+        const cached = resolvedKeys.get(message.canonicalId);
+        if (cached) { key = cached; break; }
+        if (message.threadId?.trim()) { key = `imap:${message.threadId.trim()}`; break; }
+        if (seen.has(message.canonicalId)) { key = fallbackThreadKey(message, ownerEmail); break; }
+        seen.add(message.canonicalId);
+        path.push(message);
+        const references = extractMessageIdList(message.references);
+        const candidates = [normalizeMessageId(message.inReplyTo), ...[...references].reverse()];
+        const parent = candidates.filter((id): id is string => Boolean(id))
+          .map(id => byMessageId.get(id) ?? byCanonicalId.get(id))
+          .find(candidate => candidate && candidate.canonicalId !== message.canonicalId);
+        if (parent) { message = parent; continue; }
+        const root = references[0] || normalizeMessageId(message.inReplyTo);
+        key = root ? `ref:${root}` : fallbackThreadKey(message, ownerEmail);
+        break;
       }
-
-      if (message.threadId?.trim()) {
-        const direct = `imap:${message.threadId.trim()}`;
-        resolvedKeys.set(message.canonicalId, direct);
-        return direct;
-      }
-
-      if (stack.has(message.canonicalId)) {
-        const fallback = fallbackThreadKey(message, ownerEmail);
-        resolvedKeys.set(message.canonicalId, fallback);
-        return fallback;
-      }
-
-      stack.add(message.canonicalId);
-
-      const referenceCandidates = [
-        normalizeMessageId(message.inReplyTo),
-        ...[...extractMessageIdList(message.references)].reverse(),
-      ].filter((value): value is string => Boolean(value));
-
-      for (const parentId of referenceCandidates) {
-        const parent = byMessageId.get(parentId) ?? byCanonicalId.get(parentId);
-        if (parent && parent.canonicalId !== message.canonicalId) {
-          const resolved = resolveThreadKey(parent, stack);
-          resolvedKeys.set(message.canonicalId, resolved);
-          stack.delete(message.canonicalId);
-          return resolved;
-        }
-      }
-
-      const syntheticReferenceRoot = extractMessageIdList(message.references)[0] || normalizeMessageId(message.inReplyTo);
-      if (syntheticReferenceRoot) {
-        const synthetic = `ref:${syntheticReferenceRoot}`;
-        resolvedKeys.set(message.canonicalId, synthetic);
-        stack.delete(message.canonicalId);
-        return synthetic;
-      }
-
-      const fallback = fallbackThreadKey(message, ownerEmail);
-      resolvedKeys.set(message.canonicalId, fallback);
-      stack.delete(message.canonicalId);
-      return fallback;
+      resolvedKeys.set(message.canonicalId, key);
+      for (const visited of path) resolvedKeys.set(visited.canonicalId, key);
+      return key;
     };
 
     return messages.map((message) => ({
